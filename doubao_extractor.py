@@ -31,8 +31,6 @@ if sys.platform == "win32":
 # ===== 页面配置 =====
 st.set_page_config(page_title="豆包引用提取器", page_icon="🥔", layout="wide")
 
-# ... 后面的代码保持不变 ...
-
 # ===== 自定义CSS =====
 st.markdown("""
 <style>
@@ -103,21 +101,20 @@ def extract_share_id(url):
     match = re.search(r'/thread/([a-zA-Z0-9_]+)', url)
     return match.group(1) if match else None
 
-# ===== Playwright 获取页面（无头模式，不弹窗）=====
+# ===== Playwright 获取页面（直接提取问题和回答）=====
 async def fetch_doubao_page_async(url):
-    """用 Playwright 获取渲染后的完整HTML"""
+    """用 Playwright 获取渲染后的完整HTML，并直接提取AI回答（保留HTML格式）"""
     async with async_playwright() as p:
-        # 启动浏览器（无头模式，不显示窗口）
+        # 启动浏览器（无头模式）
         browser = await p.chromium.launch(
-            headless=True,  # True=不弹窗，False=弹窗（调试用）
+            headless=True,
             args=['--disable-blink-features=AutomationControlled']
         )
         
-        # 创建上下文，模拟真实浏览器
+        # 创建上下文
         context = await browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
-            locale='zh-CN',
         )
         
         page = await context.new_page()
@@ -128,24 +125,54 @@ async def fetch_doubao_page_async(url):
         # 访问页面
         await page.goto(url, wait_until='networkidle', timeout=30000)
         
-        # 随机滚动，模拟人类阅读
-        await page.evaluate('window.scrollTo(0, document.body.scrollHeight / 2)')
-        await page.wait_for_timeout(random.randint(1000, 2000))
-        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-        await page.wait_for_timeout(random.randint(1000, 2000))
+        # 等待页面加载
+        await page.wait_for_timeout(3000)
         
-        # 获取完整HTML
+        # 1. 提取用户问题（纯文本）
+        question_text = ""
+        try:
+            question_element = await page.query_selector('div[data-testid="message_text_content"]')
+            if question_element:
+                question_text = await question_element.text_content()
+        except Exception as e:
+            print(f"提取问题出错: {e}")
+        
+        # 2. 提取AI回答 - 保留HTML格式
+        answer_html = ""
+        try:
+            # 找所有消息内容
+            message_elements = await page.query_selector_all('div[data-testid="message_content"]')
+            if len(message_elements) >= 2:
+                # 第二个是AI回答
+                answer_element = message_elements[1]
+                # 获取内部HTML，保留所有标签
+                answer_html = await answer_element.inner_html()
+        except Exception as e:
+            print(f"提取回答出错: {e}")
+        
+        # 3. 获取完整HTML（用于提取引用来源）
         html = await page.content()
+        
         await browser.close()
-        return html
+        
+        # 返回三个值：HTML, 问题, 回答HTML
+        return html, question_text, answer_html
 
 def fetch_doubao_page(url):
-    """同步包装器"""
+    """同步包装器，返回 (html, question, answer_html)"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(fetch_doubao_page_async(url))
+    html, question, answer_html = loop.run_until_complete(fetch_doubao_page_async(url))
     loop.close()
-    return result
+    return html, question, answer_html
+
+def fetch_doubao_page(url):
+    """同步包装器，返回 (html, question, answer)"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    html, question, answer = loop.run_until_complete(fetch_doubao_page_async(url))
+    loop.close()
+    return html, question, answer
 
 # ===== 核心提取函数 =====
 def extract_doubao_citations(html_content):
@@ -199,45 +226,6 @@ def extract_doubao_citations(html_content):
             continue
     
     return citations
-
-def extract_question_answer(html_content):
-    """提取用户问题和AI回答"""
-    question = ""
-    answer = ""
-    
-    # 1. 方法1：从 message_text_content 提取用户问题（最准确）
-    q_pattern = r'<div[^>]*data-testid="message_text_content"[^>]*>([^<]+)</div>'
-    q_match = re.search(q_pattern, html_content)
-    if q_match:
-        question = q_match.group(1).strip()
-    
-    # 2. 方法2：从 block_type=10000 的文本块中提取
-    if not question:
-        block_pattern = r'"block_type":10000.*?"text":"([^"]+)"'
-        q_match = re.search(block_pattern, html_content)
-        if q_match:
-            question = q_match.group(1)
-    
-    # 3. 方法3：直接从 "content" 字段提取
-    if not question:
-        text_pattern = r'"text":"([^"]+?)"'
-        texts = re.findall(text_pattern, html_content)
-        if texts:
-            # 取第一个短文本作为用户问题
-            for t in texts:
-                if len(t) < 100 and ('?' in t or '？' in t or '什么' in t or '怎么' in t):
-                    question = t
-                    break
-            if not question and texts:
-                question = texts[0]
-    
-    # 4. 找AI回答（包含表格的那段长文本）
-    answer_pattern = r'"text":"([^"]+?品牌推荐[^"]+?)"'
-    answer_match = re.search(answer_pattern, html_content)
-    if answer_match:
-        answer = answer_match.group(1)
-    
-    return question, answer
 
 # ===== DeepSeek 品牌分析函数（优化版）=====
 def analyze_brands(query, answer_text, citations_df):
@@ -399,11 +387,11 @@ if st.button("🥔 提取引用来源", type="primary", use_container_width=True
         else:
             with st.spinner("正在用浏览器加载页面（约10秒）..."):
                 try:
-                    # 用 Playwright 获取页面（自带反爬）
+                    # 用 Playwright 获取页面，直接得到问题和回答
                     max_retries = 2
                     for attempt in range(max_retries):
                         try:
-                            html_content = fetch_doubao_page(link)
+                            html_content, st.session_state.question, st.session_state.answer_text = fetch_doubao_page(link)
                             # 检查是否获取成功
                             if 'text_card' in html_content:
                                 break
@@ -419,9 +407,6 @@ if st.button("🥔 提取引用来源", type="primary", use_container_width=True
                     
                     # 提取引用来源
                     st.session_state.citations = extract_doubao_citations(html_content)
-                    
-                    # 提取问题和回答
-                    st.session_state.question, st.session_state.answer_text = extract_question_answer(html_content)
                     
                     st.session_state.extracted_data = True
                     st.success(f"✅ 提取成功！找到 {len(st.session_state.citations)} 个引用来源")
@@ -479,11 +464,12 @@ if st.session_state.extracted_data:
             key="download_citations"
         )
     
-    # ===== 显示AI回答 =====
+       # ===== 显示AI回答（保留HTML格式）=====
     if st.session_state.answer_text:
         st.markdown("---")
         st.subheader("📄 AI 回答")
-        st.markdown(st.session_state.answer_text)
+        # 使用 unsafe_allow_html 渲染HTML
+        st.markdown(st.session_state.answer_text, unsafe_allow_html=True)
 
     # ===== 品牌分析按钮（始终显示，但需要引用来源）=====
     if st.session_state.citations:  # 只要有引用来源就显示按钮
